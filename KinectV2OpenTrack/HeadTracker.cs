@@ -8,6 +8,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Kinect;
 using Microsoft.Kinect.Face;
+using static KinectV2OpenTrack.Program;
 
 namespace KinectV2OpenTrack
 {
@@ -27,15 +28,12 @@ namespace KinectV2OpenTrack
         private bool lastSensorAvail = false;
         private bool tracking = false;
 
-
-        private const int port = 4242;
-        private const string ip = "127.0.0.1";
         private Socket socket;
         private IPAddress dest;
         private IPEndPoint endPoint;
         private byte[] sendBuffer;
 
-        public void InitTracker()
+        public void InitTracker(Options o)
         {
             lastSensorAvail = false;
             sensor = KinectSensor.GetDefault();
@@ -53,12 +51,12 @@ namespace KinectV2OpenTrack
             sensor.IsAvailableChanged += SensorAvailableChanged;
             Console.WriteLine("Face tracker ready.");
             
-            dest = IPAddress.Parse(ip);
-            endPoint = new IPEndPoint(dest, port);
+            dest = IPAddress.Parse(o.Ip);
+            endPoint = new IPEndPoint(dest, o.Port);
             
             sendBuffer = new byte[48];
 
-            Console.WriteLine("UDP Socket created for port {0}", port);
+            Console.WriteLine("UDP Socket created for host {0}, port {1}", o.Ip, o.Port);
         }
 
 
