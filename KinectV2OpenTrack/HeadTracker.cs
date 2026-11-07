@@ -24,7 +24,6 @@ namespace KinectV2OpenTrack
         private Body trackedBody = null;
         private ulong currentTrackingId = 0;
 
-        private HighDefinitionFaceFrame faceFrame = null;
         private bool lastSensorAvail = false;
         private bool tracking = false;
 
@@ -32,6 +31,21 @@ namespace KinectV2OpenTrack
         private IPAddress dest;
         private IPEndPoint endPoint;
         private byte[] sendBuffer;
+
+        // Snapshot of the last good pose (x, y, z, yaw, pitch, roll) guarded by poseLock.
+        private readonly object poseLock = new object();
+        private readonly double[] lastPose = new double[6];
+        private DateTime lastPoseTime;
+        private bool havePose = false;
+        private bool lostReported = false;
+
+        // How long we keep sending the last known pose while face frames drop out.
+        private static readonly TimeSpan PoseGracePeriod = TimeSpan.FromMilliseconds(500);
+        // Interval used to re-send the held pose during a brief dropout.
+        private static readonly TimeSpan HoldResendInterval = TimeSpan.FromMilliseconds(33);
+
+        private System.Timers.Timer holdTimer;
+        private DateTime lastHoldSend;
 
         public void InitTracker(Options o)
         {
@@ -53,8 +67,18 @@ namespace KinectV2OpenTrack
             
             dest = IPAddress.Parse(o.Ip);
             endPoint = new IPEndPoint(dest, o.Port);
-            
+
             sendBuffer = new byte[48];
+
+            // Create the UDP socket once and reuse it for every packet.
+            // (Re-creating a socket per send adds unnecessary latency/overhead.)
+            socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+
+            // During brief face dropouts we keep re-sending the last known pose
+            // so opentrack does not freeze on a stale value.
+            holdTimer = new System.Timers.Timer(HoldResendInterval.TotalMilliseconds);
+            holdTimer.Elapsed += HoldTimer_Elapsed;
+            holdTimer.Start();
 
             Console.WriteLine("UDP Socket created for host {0}, port {1}", o.Ip, o.Port);
         }
@@ -77,81 +101,82 @@ namespace KinectV2OpenTrack
 
         public void StartTracking()
         {
-
-            if(!sensor.IsAvailable)
+            if (!sensor.IsAvailable)
             {
                 this.AwaitSensor();
             }
+            else
+            {
+                sensor.Open();
+            }
 
-            
             faceAlignment = new FaceAlignment();
 
             Console.WriteLine("Started Face Tracking.");
-            this.Run();
+
+            // Tracking output is now event-driven: every HD face frame that arrives is
+            // converted and sent to opentrack immediately in HdFaceReader_FrameArrived.
+            // Keep the main thread alive here.
+            while (true)
+            {
+                Thread.Sleep(500);
+            }
         }
 
-
-        private void Run()
+        private void SendPose(double x, double y, double z, double yaw, double pitch, double roll)
         {
-            List<byte> bytes = new List<byte>();
+            // Opentrack UDP packet: 6 doubles (position in cm, angles in degrees).
+            BitConverter.GetBytes(x).CopyTo(sendBuffer, 0);
+            BitConverter.GetBytes(y).CopyTo(sendBuffer, 8);
+            BitConverter.GetBytes(z).CopyTo(sendBuffer, 16);
+            BitConverter.GetBytes(yaw).CopyTo(sendBuffer, 24);
+            BitConverter.GetBytes(pitch).CopyTo(sendBuffer, 32);
+            BitConverter.GetBytes(roll).CopyTo(sendBuffer, 40);
 
-            tracking = true;
-            while (tracking)
+            try
             {
-                if (faceFrame == null || !faceFrame.IsFaceTracked)
+                socket.SendTo(sendBuffer, endPoint);
+            }
+            catch (Exception send_exception)
+            {
+                Console.WriteLine("UDP Socket Exception: {0}", send_exception.Message);
+            }
+        }
+
+        private void HoldTimer_Elapsed(object sender, System.Timers.ElapsedEventArgs e)
+        {
+            double[] pose;
+
+            lock (poseLock)
+            {
+                if (!havePose)
                 {
-                    Thread.Sleep(100);
-                    continue;
+                    return;
                 }
 
-                // Orientation Quaternion
-                double qW = faceAlignment.FaceOrientation.W;
-                double qX = faceAlignment.FaceOrientation.X;
-                double qY = faceAlignment.FaceOrientation.Y;
-                double qZ = faceAlignment.FaceOrientation.Z;
-
-                // Location in 3D space in cm
-                double lX = 100 * faceAlignment.HeadPivotPoint.X;
-                double lY = 100 * faceAlignment.HeadPivotPoint.Y;
-                double lZ = 100 * faceAlignment.HeadPivotPoint.Z;
-                
-                // Get Euler angles in radians
-                double yaw = Math.Asin(2.0 * (qX * qZ - qW * qY));
-                double pitch = Math.Atan2(2.0 * (qW * qX + qY * qZ), 1.0 - 2.0 * (qX * qX + qY * qY));
-                double roll = Math.Atan2(2.0 * qX * qY + 2.0 * qZ * qW, 1.0 - 2.0 * (qY * qY + qZ * qZ));
-
-
-                bytes.Clear();
-                bytes.AddRange(BitConverter.GetBytes(lX));
-                bytes.AddRange(BitConverter.GetBytes(lY));
-                bytes.AddRange(BitConverter.GetBytes(lZ));
-                bytes.AddRange(BitConverter.GetBytes(180 / Math.PI * yaw));
-                bytes.AddRange(BitConverter.GetBytes(180 / Math.PI * pitch));
-                bytes.AddRange(BitConverter.GetBytes(180 / Math.PI * roll));
-
-                sendBuffer = bytes.ToArray();
-
-                try
+                if (DateTime.UtcNow - lastPoseTime > PoseGracePeriod)
                 {
-                    using (socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp))
+                    // Dropout lasted longer than the grace period: stop holding the pose.
+                    havePose = false;
+                    if (!lostReported)
                     {
-                        socket.SendTo(sendBuffer, endPoint);
+                        lostReported = true;
+                        Console.WriteLine("Face tracking signal lost.");
                     }
+                    return;
                 }
-                catch (Exception send_exception)
+
+                if (DateTime.UtcNow - lastHoldSend < HoldResendInterval)
                 {
-                    Console.WriteLine("UDP Socket Exception: {0}", send_exception.Message);
+                    return;
                 }
 
-                //Console.WriteLine("X: {0}  Y: {1}  Z: {2}", lX, lY, lZ);
-                //Console.WriteLine("Yaw: {0}  Pitch: {1}  Roll: {2}", yaw, pitch, roll);
-
-                Thread.Sleep(25);
+                lastHoldSend = DateTime.UtcNow;
+                pose = (double[])lastPose.Clone();
             }
 
-            this.AwaitSensor();
+            SendPose(pose[0], pose[1], pose[2], pose[3], pose[4], pose[5]);
         }
-
 
         private void NewBodyReaderFrame(object sender, BodyFrameArrivedEventArgs e)
         {
@@ -227,13 +252,50 @@ namespace KinectV2OpenTrack
         
         private void HdFaceReader_FrameArrived(object sender, HighDefinitionFaceFrameArrivedEventArgs e)
         {
-            faceFrame = e.FrameReference.AcquireFrame();
-            if (faceFrame == null || !faceFrame.IsFaceTracked)
+            // Always dispose frames. Leaking native frames can stall the reader,
+            // which was a likely cause of tracking dropping out.
+            using (var frame = e.FrameReference.AcquireFrame())
             {
-                return;
-            }
+                if (frame == null || !frame.IsFaceTracked)
+                {
+                    return;
+                }
 
-            faceFrame.GetAndRefreshFaceAlignmentResult(this.faceAlignment);
+                frame.GetAndRefreshFaceAlignmentResult(this.faceAlignment);
+
+                // Orientation Quaternion
+                double qW = this.faceAlignment.FaceOrientation.W;
+                double qX = this.faceAlignment.FaceOrientation.X;
+                double qY = this.faceAlignment.FaceOrientation.Y;
+                double qZ = this.faceAlignment.FaceOrientation.Z;
+
+                // Location in 3D space in cm
+                double lX = 100 * this.faceAlignment.HeadPivotPoint.X;
+                double lY = 100 * this.faceAlignment.HeadPivotPoint.Y;
+                double lZ = 100 * this.faceAlignment.HeadPivotPoint.Z;
+
+                // Get Euler angles in degrees
+                double yaw = 180 / Math.PI * Math.Asin(2.0 * (qX * qZ - qW * qY));
+                double pitch = 180 / Math.PI * Math.Atan2(2.0 * (qW * qX + qY * qZ), 1.0 - 2.0 * (qX * qX + qY * qY));
+                double roll = 180 / Math.PI * Math.Atan2(2.0 * qX * qY + 2.0 * qZ * qW, 1.0 - 2.0 * (qY * qY + qZ * qZ));
+
+                lock (poseLock)
+                {
+                    lastPose[0] = lX;
+                    lastPose[1] = lY;
+                    lastPose[2] = lZ;
+                    lastPose[3] = yaw;
+                    lastPose[4] = pitch;
+                    lastPose[5] = roll;
+                    lastPoseTime = DateTime.UtcNow;
+                    havePose = true;
+                    lostReported = false;
+                }
+
+                // Send immediately: this is the freshest possible pose, so latency
+                // is limited only by the Kinect frame rate (~30 fps).
+                SendPose(lX, lY, lZ, yaw, pitch, roll);
+            }
         }
 
         
@@ -249,7 +311,7 @@ namespace KinectV2OpenTrack
         private static Body FindClosestBody(BodyFrame bodyFrame)
         {
             Body result = null;
-            double closestBodyDistance = double.MaxValue;
+            double bestScore = double.MaxValue;
 
             Body[] bodies = new Body[bodyFrame.BodyCount];
             bodyFrame.GetAndRefreshBodyData(bodies);
@@ -258,14 +320,24 @@ namespace KinectV2OpenTrack
             {
                 if (body.IsTracked)
                 {
-                    var currentLocation = body.Joints[JointType.SpineBase].Position;
+                    // Prefer bodies whose head is already tracked: HD face tracking
+                    // can only start on a body with a usable head, so a slightly
+                    // closer body without a tracked head is a poor choice.
+                    bool headTracked = body.Joints[JointType.Head].TrackingState
+                                            == TrackingState.Tracked;
 
-                    var currentDistance = VectorLength(currentLocation);
+                    var headLocation = body.Joints[JointType.Head].Position;
+                    double headDistance = VectorLength(headLocation);
 
-                    if (result == null || currentDistance < closestBodyDistance)
+                    // Bodies with a tracked head always win; among equals, the
+                    // closest head wins. The +10.0 penalty pushes headless bodies
+                    // behind any body with a tracked head at a realistic distance.
+                    double score = headDistance + (headTracked ? 0.0 : 10.0);
+
+                    if (score < bestScore)
                     {
                         result = body;
-                        closestBodyDistance = currentDistance;
+                        bestScore = score;
                     }
                 }
             }
